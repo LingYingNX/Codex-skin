@@ -1,6 +1,8 @@
 # Codex 皮肤
 
 给 Codex 桌面版加壁纸，并在「设置 → 外观」里加一个皮肤面板。
+<img width="851" height="431" alt="image" src="https://github.com/user-attachments/assets/43cc0c8c-cbd0-409d-8726-66f0b21dfeaa" />
+
 
 ## 安装 / 卸载
 
