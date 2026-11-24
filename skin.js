@@ -1,7 +1,7 @@
 /* Codex 皮肤 — renderer payload, injected by skin-host.ps1 over CDP */
 (function () {
   "use strict";
-  var VERSION = "0.1";
+  var VERSION = "0.1.1";
   var GLOBAL_KEY = "__codexSkinRuntime";
   var LS_KEY = "codexSkin.v1";
   var DB_NAME = "codexSkin";
@@ -12,7 +12,6 @@
   var PANEL_ID = "codex-skin-panel";
   var SWITCH_ID = "codex-skin-switch";
   var UPDATE_ID = "codex-skin-update";
-  var UPDATE_REQ_KEY = "codexSkin.update.request";
   var UPDATE_STATE_KEY = "codexSkin.update.state";
   var SECTION_ID = "codex-skin-section";
   var ON_CLASS = "codex-skin-on";
@@ -474,10 +473,22 @@
 
   function checkForUpdate() {
     if (updateBusy) return;
-    updateBusy = true;
     var token = String(Date.now());
-    try { localStorage.setItem(UPDATE_REQ_KEY, token); } catch (e) { }
+    /* 唯一的通道：宿主用 CDP binding 暴露这个函数。它只在点击时被调用，
+       宿主平时阻塞在 socket 上，不会定时去问面板要更新。 */
+    if (typeof window.codexSkinUpdate !== "function") {
+      setUpdLabel("更新不可用", "cs-bad", "宿主没在运行，先跑一次 install.ps1");
+      return;
+    }
+    updateBusy = true;
     setUpdLabel("检查中…", "cs-busy", "宿主正在拉取远端");
+    try {
+      window.codexSkinUpdate(token);
+    } catch (e) {
+      updateBusy = false;
+      setUpdLabel("更新失败", "cs-bad", "宿主没有应答");
+      return;
+    }
     var startedAt = Date.now();
     if (updateTimer) clearInterval(updateTimer);
     updateTimer = setInterval(function () {

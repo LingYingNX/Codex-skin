@@ -20,12 +20,26 @@ function Get-SkinSource() {
   return [System.IO.File]::ReadAllText($ScriptPath, [System.Text.Encoding]::UTF8)
 }
 
-function Test-CodexRunning() {
-  $p = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
-  return ($null -ne $p)
+# The CDP port is the only signal the host actually needs: Codex is up and
+# debuggable. Watching it costs one refused TCP connect (~0.5ms) per tick and
+# follows the process lifetime for free, where enumerating processes to find
+# ChatGPT.exe costs ~7ms and does not tell us whether injection is possible yet.
+function Test-CdpPort([int]$timeoutMs) {
+  $c = New-Object System.Net.Sockets.TcpClient
+  try {
+    $t = $c.BeginConnect("127.0.0.1", $Port, $null, $null)
+    if (-not $t.AsyncWaitHandle.WaitOne($timeoutMs)) { return $false }
+    $c.EndConnect($t)
+    return $true
+  } catch {
+    return $false
+  } finally {
+    $c.Close()
+  }
 }
 
 function Find-PageTarget() {
+  if (-not (Test-CdpPort 300)) { return $null }
   try {
     $list = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/json/list") -TimeoutSec 3
   } catch { return $null }
@@ -40,7 +54,7 @@ function Wait-PageTarget([int]$timeoutSec) {
   while ((Get-Date) -lt $deadline) {
     $t = Find-PageTarget
     if ($t) { return $t }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 2000
   }
   return $null
 }
@@ -114,8 +128,9 @@ class CdpSession {
     while ((Get-Date) -lt $deadline) {
       $raw = $this.ReceiveMessage(5000)
       if ($null -eq $raw) { continue }
-      try { $msg = $raw | ConvertFrom-Json } catch { continue }
-      if ($msg.PSObject.Properties.Name -contains "id" -and $msg.id -eq $id) { return $raw }
+      # Prefix match instead of a JSON parse: this runs on every CDP round trip,
+      # and ConvertFrom-Json on every response was the bulk of a probe's cost.
+      if ($raw.StartsWith('{"id":' + $id + ',')) { return $raw }
     }
     throw ("CDP timeout: " + $method)
   }
@@ -134,8 +149,19 @@ function Invoke-Evaluate($cdp, [string]$expression) {
   return $obj.result.result
 }
 
-# Probed every few seconds: liveness plus any pending update request the UI queued.
-$ProbeExpr = "JSON.stringify({v:(window.__codexSkinRuntime||{}).version||null,req:(function(){try{return localStorage.getItem('codexSkin.update.request')}catch(e){return null}})()})"
+# The panel pushes an update request through a CDP binding, so the host never
+# polls: it blocks on the socket and wakes only when the button is pressed.
+$BindingName = "codexSkinUpdate"
+
+function Get-BindingPayload([string]$raw) {
+  try {
+    $msg = $raw | ConvertFrom-Json
+    if ($msg.method -eq "Runtime.bindingCalled" -and $msg.params.name -eq $BindingName) {
+      return [string]$msg.params.payload
+    }
+  } catch { }
+  return $null
+}
 
 function Short-Hash([string]$h) {
   if ($h -and $h.Length -ge 7) { return $h.Substring(0, 7) }
@@ -208,8 +234,10 @@ function Attach-AndInject() {
   try {
     $cdp.Connect($target.webSocketDebuggerUrl)
     Write-Log ("attached: " + $target.id)
-    [void]$cdp.Send("Page.enable", $null)
-    [void]$cdp.Send("Runtime.enable", $null)
+    # No Page.enable / Runtime.enable on purpose: they flood the socket with
+    # console and navigation events (hundreds per second), and the idle loop now
+    # blocks on that socket. addBinding and evaluate work without them.
+    [void]$cdp.Send("Runtime.addBinding", @{ name = $BindingName })
     $source = Get-SkinSource
     $reg = $cdp.Send("Page.addScriptToEvaluateOnNewDocument", @{ source = $source })
     Write-Log ("auto-inject registered id=" + ($reg | ConvertFrom-Json).result.identifier)
@@ -234,15 +262,33 @@ if (-not $createdNew) {
   exit 0
 }
 
+# Held open (FileShare.None) for the life of this process, so the launcher can
+# tell "already running" from "gone" with a file open instead of starting a
+# second powershell.exe. A full PS 5.1 start costs ~0.9s of CPU, and the task
+# fires on a timer, so that spawn used to land as a hitch every time it ran.
+$pidLock = $null
+try {
+  $pidLockPath = Join-Path $here "skin-host.pid"
+  $pidLock = [System.IO.File]::Open($pidLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  $pidBytes = [System.Text.Encoding]::ASCII.GetBytes([string]$PID)
+  $pidLock.SetLength(0)
+  $pidLock.Write($pidBytes, 0, $pidBytes.Length)
+  $pidLock.Flush()
+} catch {
+  $pidLock = $null
+}
+
 Write-Log ("start port=" + $Port + " script=" + $ScriptPath + " process=" + $ProcessName + " watch=" + $Watch)
-if (-not (Test-CodexRunning)) { Write-Log "waiting for Codex to start" }
+if (-not (Test-CdpPort 300)) { Write-Log "waiting for Codex CDP port" }
 
 while ($true) {
-  # Wait for Codex to appear (resident mode must not burn the 90s attach timeout)
-  if (-not (Test-CodexRunning)) {
-    if (-not $Watch) { Write-Log "Codex not running, host exits"; break }
-    while (-not (Test-CodexRunning)) { Start-Sleep -Milliseconds 800 }
-    Write-Log "Codex started"
+  # Sit on the port instead of on the process list (resident mode must not burn
+  # the 90s attach timeout). Polling a refused connect is ~0.5ms, so this loop
+  # idles at a few hundredths of a percent of one core.
+  if (-not (Test-CdpPort 300)) {
+    if (-not $Watch) { Write-Log "Codex CDP port not up, host exits"; break }
+    while (-not (Test-CdpPort 300)) { Start-Sleep -Seconds 3 }
+    Write-Log "Codex CDP port up"
   }
 
   $cdp = $null
@@ -258,32 +304,30 @@ while ($true) {
     break
   }
 
-  # Stay with Codex; re-attach if the socket drops or the renderer loses the runtime
-  $probeAt = Get-Date
-  while (Test-CodexRunning) {
-    Start-Sleep -Seconds 2
-    if ($cdp.Ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) { Write-Log "cdp closed, re-attach"; break }
-    if (((Get-Date) - $probeAt).TotalSeconds -ge 4) {
-      $probeAt = Get-Date
-      try {
-        $p = Invoke-Evaluate $cdp $ProbeExpr
-        $info = $p.value | ConvertFrom-Json
-        if (-not $info.v) { Write-Log ("runtime gone (" + $p.value + "), re-inject"); break }
-        if ($info.req) {
-          [void](Invoke-Evaluate $cdp "localStorage.removeItem('codexSkin.update.request')")
-          Invoke-SkinUpdate $cdp $info.req
-        }
-      } catch {
-        Write-Log "probe failed, re-attach"
-        break
-      }
+  # Blocked on the socket until the panel asks for something. No timer, no probe:
+  # an idle host costs nothing, and a dropped socket (Codex exited) ends the wait.
+  while ($true) {
+    $raw = $null
+    try {
+      $raw = $cdp.ReceiveMessage(86400000)
+    } catch {
+      Write-Log ("receive failed: " + $_.Exception.Message)
+      break
     }
+    if ($null -eq $raw) { Write-Log "cdp closed, re-attach"; break }
+    $token = Get-BindingPayload $raw
+    if ($token) {
+      Write-Log ("update requested by panel (" + $token + ")")
+      Invoke-SkinUpdate $cdp $token
+    }
+    if ($cdp.Ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) { Write-Log "cdp closed, re-attach"; break }
   }
 
-  if (-not (Test-CodexRunning)) { Write-Log "Codex exited" }
+  if (-not (Test-CdpPort 300)) { Write-Log "Codex exited" } else { Write-Log "re-attaching" }
   $cdp.Close()
   if (-not $Watch) { break }
   Start-Sleep -Seconds 1
 }
 
+if ($pidLock) { try { $pidLock.Dispose() } catch { } }
 Write-Log "host stopped"

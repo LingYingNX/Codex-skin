@@ -1,2 +1,3 @@
 # 运行时日志：含本机绝对路径与时间戳，不是源码
 skin-host.log
+skin-host.pid

@@ -48,17 +48,19 @@ if ($flavor -ne "dev" -or -not $switches) {
 $action = New-ScheduledTaskAction -Execute $wscript -Argument ('//B "{0}"' -f $vbsLauncher)
 $logon = New-ScheduledTaskTrigger -AtLogOn
 $logon.Delay = "PT30S"
-# Repetition keeps the host alive after it exits or crashes; the mutex makes repeats idempotent.
-$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
+# Repetition is only insurance for a host that died: the resident host never exits
+# while it can see Codex. Every extra fire costs a full powershell.exe start (~0.9s
+# of CPU, measured), and that lands as a hitch every time it happens, so keep it rare.
+$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
-  -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+  -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 5) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logon, $repeat) -Settings $settings -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName
 Start-Sleep -Seconds 2
 
 Write-Host "Installed:"
-Write-Host ("  Scheduled task: " + $taskName + " (at logon +30s, then every minute; single instance)")
+Write-Host ("  Scheduled task: " + $taskName + " (at logon +30s, then every 5 min as a fallback; single instance)")
 Write-Host "  Old host stopped, new one started."
 Write-Host "  Host is resident: it waits for Codex, injects on start, re-attaches on reload/crash."
 Write-Host "  Start Codex any way you like - Start menu, taskbar, codex:// - no special launcher needed."
