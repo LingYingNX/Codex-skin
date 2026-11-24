@@ -1,7 +1,7 @@
 /* Codex 皮肤 — renderer payload, injected by skin-host.ps1 over CDP */
 (function () {
   "use strict";
-  var VERSION = "1.0.21";
+  var VERSION = "1.0.22";
   var GLOBAL_KEY = "__codexSkinRuntime";
   var LS_KEY = "codexSkin.v1";
   var DB_NAME = "codexSkin";
@@ -11,6 +11,9 @@
   var WP_ID = "codex-skin-wallpaper";
   var PANEL_ID = "codex-skin-panel";
   var SWITCH_ID = "codex-skin-switch";
+  var UPDATE_ID = "codex-skin-update";
+  var UPDATE_REQ_KEY = "codexSkin.update.request";
+  var UPDATE_STATE_KEY = "codexSkin.update.state";
   var SECTION_ID = "codex-skin-section";
   var ON_CLASS = "codex-skin-on";
   var MAX_BYTES = 64 * 1024 * 1024;
@@ -41,6 +44,8 @@
   var fileInput = null;
   var dims = {};
   var onResize = null;
+  var updateTimer = null;
+  var updateBusy = false;
 
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
   function clamp(n, a, b) { n = Number(n); if (!isFinite(n)) n = a; return Math.min(b, Math.max(a, n)); }
@@ -271,7 +276,14 @@
     "#" + SECTION_ID + " .cs-switch[aria-checked=\"true\"] { background: #5B6BFF; border-color: #5B6BFF; }",
     "#" + SECTION_ID + " .cs-switch .cs-knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s ease; }",
     "#" + SECTION_ID + " .cs-switch[aria-checked=\"true\"] .cs-knob { transform: translateX(14px); }",
-    "#" + SECTION_ID + " .cs-switch:focus-visible { outline: 2px solid #5B6BFF; outline-offset: 2px; }"
+    "#" + SECTION_ID + " .cs-switch:focus-visible { outline: 2px solid #5B6BFF; outline-offset: 2px; }",
+    "#" + SECTION_ID + " .cs-update { display: inline-flex; align-items: center; gap: 5px; height: 26px; min-width: 96px; justify-content: center; padding: 0 9px; border: 1px solid rgba(255,255,255,.14); border-radius: 5px; background: rgba(255,255,255,.06); font-size: 13px; color: #DFDFDF; cursor: pointer; }",
+    "#" + SECTION_ID + " .cs-update svg { flex: 0 0 auto; }",
+    "#" + SECTION_ID + " .cs-update:hover { color: #F2F4F8; border-color: rgba(255,255,255,.28); }",
+    "#" + SECTION_ID + " .cs-update.cs-busy { opacity: .7; }",
+    "#" + SECTION_ID + " .cs-update.cs-ok { color: #7BE0A3; border-color: rgba(123,224,163,.4); }",
+    "#" + SECTION_ID + " .cs-update.cs-bad { color: #FF9A9A; border-color: rgba(255,154,154,.4); }",
+    "#" + SECTION_ID + " .cs-update:focus-visible { outline: 2px solid #5B6BFF; outline-offset: 2px; }"
   ].join("");
 
   function ensureStyle() {
@@ -285,6 +297,8 @@
   }
 
   var HINT_TEXT = "点 + 导入图片（\u2264 64MB）";
+
+  var REFRESH_SVG = "<svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12a9 9 0 1 1-2.64-6.36\"/><path d=\"M21 3v6h-6\"/></svg>";
 
   var TRASH_SVG = "<svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"M19 6l-1 14H6L5 6\"/><path d=\"M10 11v5\"/><path d=\"M14 11v5\"/></svg>";
 
@@ -436,6 +450,53 @@
     if (card) card.classList.toggle("cs-off", !state.enabled);
   }
 
+  /* ---------- 检查更新：renderer 无法匿名读私有仓库，所以只把请求写进 localStorage，由宿主执行 git 拉取 ---------- */
+  function setUpdLabel(text, cls, title) {
+    var b = document.getElementById(UPDATE_ID);
+    if (!b) return;
+    var span = b.querySelector(".cs-upd-label");
+    if (span) span.textContent = text;
+    b.classList.remove("cs-ok", "cs-bad", "cs-busy");
+    if (cls) b.classList.add(cls);
+    b.title = title || text;
+  }
+
+  function restoreUpdateLabel() {
+    var st = null;
+    try { st = JSON.parse(localStorage.getItem(UPDATE_STATE_KEY) || "null"); } catch (e) { }
+    if (!st || !st.at) return;
+    /* 更新成功会换一个新实例重建面板，所以结果只能靠这里回读 */
+    if (Date.now() - st.at > 120000) return;
+    if (st.updated) setUpdLabel("已更新 " + (st.version || ""), "cs-ok", st.message || "刚拉取并热更新完成");
+    else if (st.ok) setUpdLabel("已是最新", "cs-ok", st.message || "远端没有新提交");
+    else setUpdLabel("更新失败", "cs-bad", st.message || "宿主没有返回原因");
+  }
+
+  function checkForUpdate() {
+    if (updateBusy) return;
+    updateBusy = true;
+    var token = String(Date.now());
+    try { localStorage.setItem(UPDATE_REQ_KEY, token); } catch (e) { }
+    setUpdLabel("检查中…", "cs-busy", "宿主正在拉取远端");
+    var startedAt = Date.now();
+    if (updateTimer) clearInterval(updateTimer);
+    updateTimer = setInterval(function () {
+      var st = null;
+      try { st = JSON.parse(localStorage.getItem(UPDATE_STATE_KEY) || "null"); } catch (e) { }
+      if (st && st.for === token) {
+        clearInterval(updateTimer); updateTimer = null; updateBusy = false;
+        if (st.updated) setUpdLabel("已更新 " + (st.version || ""), "cs-ok", st.message || "已热更新");
+        else if (st.ok) setUpdLabel("已是最新", "cs-ok", st.message || "远端没有新提交");
+        else setUpdLabel("更新失败", "cs-bad", st.message || "宿主没有返回原因");
+        return;
+      }
+      if (Date.now() - startedAt > 45000) {
+        clearInterval(updateTimer); updateTimer = null; updateBusy = false;
+        setUpdLabel("无响应", "cs-bad", "宿主没应答，看 skin-host.log");
+      }
+    }, 400);
+  }
+
   function renderControls() {
     var host = document.getElementById(PANEL_ID);
     if (!host) return;
@@ -491,8 +552,17 @@
       renderSwitch();
       applyWallpaper();
     });
-    /* 开关跟着标题文字走，不再被 justify-between 推到最右边 */
+    var upd = document.createElement("button");
+    upd.type = "button";
+    upd.id = UPDATE_ID;
+    upd.className = "cs-update";
+    upd.title = "检查更新";
+    upd.setAttribute("aria-label", "检查更新");
+    upd.innerHTML = REFRESH_SVG + "<span class=\"cs-upd-label\">检查更新</span>";
+    upd.addEventListener("click", checkForUpdate);
+    /* 开关和更新按钮都跟着标题文字走，不再被 justify-between 推到最右边 */
     head.firstElementChild.appendChild(sw);
+    head.firstElementChild.appendChild(upd);
     var body = document.createElement("div");
     body.className = "flex flex-col gap-1.5";
     var holder = document.createElement("div");
@@ -506,6 +576,7 @@
     renderSlots();
     renderControls();
     renderSwitch();
+    restoreUpdateLabel();
   }
 
   function sync() {
@@ -549,6 +620,7 @@
       if (observer) { observer.disconnect(); observer = null; }
       if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
       if (onResize) { window.removeEventListener("resize", onResize); onResize = null; }
+      if (updateTimer) { clearInterval(updateTimer); updateTimer = null; }
       for (var k in urls) { try { URL.revokeObjectURL(urls[k]); } catch (e) { } }
       urls = {};
       if (fileInput) { try { fileInput.remove(); } catch (e) { } fileInput = null; }

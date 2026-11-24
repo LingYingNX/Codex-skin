@@ -134,6 +134,73 @@ function Invoke-Evaluate($cdp, [string]$expression) {
   return $obj.result.result
 }
 
+# Probed every few seconds: liveness plus any pending update request the UI queued.
+$ProbeExpr = "JSON.stringify({v:(window.__codexSkinRuntime||{}).version||null,req:(function(){try{return localStorage.getItem('codexSkin.update.request')}catch(e){return null}})()})"
+
+function Short-Hash([string]$h) {
+  if ($h -and $h.Length -ge 7) { return $h.Substring(0, 7) }
+  return $h
+}
+
+# The renderer cannot read a private repo, so the button only drops a token in
+# localStorage; the real check is a git fetch here, with the machine's credentials.
+function Set-UpdateState($cdp, [string]$token, $state) {
+  $state["for"] = $token
+  if (-not $state.ContainsKey("at")) { $state["at"] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+  $json = $state | ConvertTo-Json -Compress
+  # Ship as a JS single-quoted literal: only backslashes and single quotes need escaping.
+  $lit = $json.Replace("\", "\\").Replace("'", "\'")
+  [void](Invoke-Evaluate $cdp ("localStorage.setItem('codexSkin.update.state', '" + $lit + "')"))
+}
+
+function Invoke-SkinUpdate($cdp, [string]$token) {
+  $state = @{ ok = $false; updated = $false; version = $null; message = ""; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $env:GIT_TERMINAL_PROMPT = "0"
+    $oldHead = (& git -C $here rev-parse HEAD 2>&1) -join " "
+    if ($LASTEXITCODE -ne 0) { $state.message = "not a git checkout: $oldHead"; return (Set-UpdateState $cdp $token $state) }
+    $fetch = (& git -C $here fetch --quiet origin 2>&1) -join " "
+    if ($LASTEXITCODE -ne 0) { $state.message = "fetch failed: $fetch"; return (Set-UpdateState $cdp $token $state) }
+    $newHead = (& git -C $here rev-parse origin/main 2>&1) -join " "
+    if ($LASTEXITCODE -ne 0) { $state.message = "no origin/main: $newHead"; return (Set-UpdateState $cdp $token $state) }
+    if ($newHead.Trim() -eq $oldHead.Trim()) {
+      $state.ok = $true
+      $state.message = ("up to date at " + (Short-Hash $oldHead))
+      return (Set-UpdateState $cdp $token $state)
+    }
+    $merge = (& git -C $here merge --ff-only origin/main 2>&1) -join " "
+    if ($LASTEXITCODE -ne 0) { $state.message = "merge failed: $merge"; return (Set-UpdateState $cdp $token $state) }
+    Write-Log ("update pulled " + (Short-Hash $oldHead) + ".." + (Short-Hash $newHead))
+    $changed = (& git -C $here diff --name-only $oldHead.Trim() $newHead.Trim() 2>&1) -join " "
+    $hostChanged = $changed -match "skin-host\.ps1"
+    $source = Get-SkinSource
+    try {
+      [void](Invoke-Evaluate $cdp $source)
+      $probe = Invoke-Evaluate $cdp "JSON.stringify({v:(window.__codexSkinRuntime||{}).version||null})"
+      $state.ok = $true
+      $state.updated = $true
+      $state.version = ($probe.value | ConvertFrom-Json).v
+      if ($hostChanged) { $state.message = "hot-swapped; skin-host.ps1 changed, run install.ps1" }
+      else { $state.message = "hot-swapped" }
+      Write-Log ("update applied v=" + $state.version)
+    } catch {
+      # A broken payload would take the panel with it, so put the old file back.
+      $state.message = ("inject failed, rolled back: " + $_.Exception.Message)
+      Write-Log ("update inject failed: " + $_.Exception.Message)
+      [void](& git -C $here checkout $oldHead.Trim() -- skin.js 2>&1)
+      try { [void](Invoke-Evaluate $cdp (Get-SkinSource)) } catch { }
+    }
+  } catch {
+    $state.message = ("update error: " + $_.Exception.Message)
+    Write-Log ("update error: " + $_.Exception.Message)
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+  return (Set-UpdateState $cdp $token $state)
+}
+
 function Attach-AndInject() {
   $target = Wait-PageTarget 90
   if (-not $target) { Write-Log "page target not found"; return $null }
@@ -196,11 +263,16 @@ while ($true) {
   while (Test-CodexRunning) {
     Start-Sleep -Seconds 2
     if ($cdp.Ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) { Write-Log "cdp closed, re-attach"; break }
-    if (((Get-Date) - $probeAt).TotalSeconds -ge 30) {
+    if (((Get-Date) - $probeAt).TotalSeconds -ge 4) {
       $probeAt = Get-Date
       try {
-        $p = Invoke-Evaluate $cdp "JSON.stringify({v:(window.__codexSkinRuntime||{}).version||null})"
-        if ($p.value -notmatch '"v":"') { Write-Log ("runtime gone (" + $p.value + "), re-inject"); break }
+        $p = Invoke-Evaluate $cdp $ProbeExpr
+        $info = $p.value | ConvertFrom-Json
+        if (-not $info.v) { Write-Log ("runtime gone (" + $p.value + "), re-inject"); break }
+        if ($info.req) {
+          [void](Invoke-Evaluate $cdp "localStorage.removeItem('codexSkin.update.request')")
+          Invoke-SkinUpdate $cdp $info.req
+        }
       } catch {
         Write-Log "probe failed, re-attach"
         break
