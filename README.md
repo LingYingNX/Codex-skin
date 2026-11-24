@@ -94,3 +94,5 @@ node --test skin.test.mjs
 # 不 bump VERSION 的话新载荷会让位给旧实例，改动看不到
 ```
 
+
+<!-- hot-update smoke test -->
