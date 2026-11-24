@@ -1,7 +1,7 @@
 /* Codex 皮肤 — renderer payload, injected by skin-host.ps1 over CDP */
 (function () {
   "use strict";
-  var VERSION = "1.0.15";
+  var VERSION = "1.0.21";
   var GLOBAL_KEY = "__codexSkinRuntime";
   var LS_KEY = "codexSkin.v1";
   var DB_NAME = "codexSkin";
@@ -10,6 +10,7 @@
   var STYLE_ID = "codex-skin-style";
   var WP_ID = "codex-skin-wallpaper";
   var PANEL_ID = "codex-skin-panel";
+  var SWITCH_ID = "codex-skin-switch";
   var SECTION_ID = "codex-skin-section";
   var ON_CLASS = "codex-skin-on";
   var MAX_BYTES = 64 * 1024 * 1024;
@@ -25,14 +26,6 @@
     { key: "positionY", label: "上下移动" }
   ];
 
-  /* 内置预设壁纸：纯 canvas 生成，不占插件文件也不进仓库 */
-  var PRESETS = [
-    { a: "#241a33", b: "#4a3566", c: "#8a6bb5", glow: "rgba(255,146,88,.22)" },
-    { a: "#0d1a2b", b: "#1d4360", c: "#3f8fb0", glow: "rgba(120,200,255,.18)" },
-    { a: "#241b14", b: "#4d3a25", c: "#8f6b42", glow: "rgba(255,190,110,.20)" },
-    { a: "#101d18", b: "#22463a", c: "#3f7a62", glow: "rgba(140,255,200,.14)" }
-  ];
-
   var previous = window[GLOBAL_KEY];
   if (previous) {
     if (previous.version === VERSION) { previous.ensure(); return; }
@@ -40,12 +33,14 @@
     try { if (previous.shutdown) previous.shutdown(); } catch (e) { }
   }
 
-  var state = { activeSlot: null, controls: clone(DEFAULT_CONTROLS) };
+  var state = { activeSlot: null, controls: clone(DEFAULT_CONTROLS), enabled: true };
   var urls = {};
   var pendingSlot = null;
   var observer = null;
   var syncTimer = null;
   var fileInput = null;
+  var dims = {};
+  var onResize = null;
 
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
   function clamp(n, a, b) { n = Number(n); if (!isFinite(n)) n = a; return Math.min(b, Math.max(a, n)); }
@@ -87,6 +82,7 @@
         }
       }
       if (o && typeof o.activeSlot === "number" && o.activeSlot >= 0 && o.activeSlot < SLOTS) state.activeSlot = o.activeSlot;
+      if (o && typeof o.enabled === "boolean") state.enabled = o.enabled;
     } catch (e) { }
   }
   function saveState() {
@@ -131,21 +127,36 @@
   }
   function setUrl(i, blob) {
     if (urls[i]) { try { URL.revokeObjectURL(urls[i]); } catch (e) { } }
-    urls[i] = URL.createObjectURL(blob);
+    var url = URL.createObjectURL(blob);
+    urls[i] = url;
+    var probe = new Image();
+    probe.onload = function () {
+      dims[i] = { w: probe.naturalWidth, h: probe.naturalHeight };
+      probe.onload = null;
+      if (state.activeSlot === i) applyWallpaper();
+    };
+    probe.onerror = function () { probe.onerror = null; };
+    probe.src = url;
   }
 
   /* ---------- 壁纸层 ---------- */
   function ensureWallpaper() {
     var el = document.getElementById(WP_ID);
-    if (el) return el;
+    if (el) {
+      if (el.querySelector(".cs-blur")) return el;
+      el.remove();
+    }
     if (!document.body) return null;
     el = document.createElement("div");
     el.id = WP_ID;
+    var layer = document.createElement("div");
+    layer.className = "cs-blur";
     var img = document.createElement("div");
     img.className = "cs-img";
+    layer.appendChild(img);
     var tint = document.createElement("div");
     tint.className = "cs-tint";
-    el.appendChild(img);
+    el.appendChild(layer);
     el.appendChild(tint);
     document.body.appendChild(el);
     return el;
@@ -154,28 +165,57 @@
   function applyWallpaper() {
     var el = ensureWallpaper();
     if (!el) return;
+    var layer = el.querySelector(".cs-blur");
     var img = el.querySelector(".cs-img");
     var tint = el.querySelector(".cs-tint");
     var c = state.controls;
     var url = state.activeSlot === null ? "" : (urls[state.activeSlot] || "");
     var root = document.documentElement;
-    if (!url) {
+    if (!url || !state.enabled) {
       root.classList.remove(ON_CLASS);
       el.style.display = "none";
       return;
     }
     root.classList.add(ON_CLASS);
     el.style.display = "block";
-    img.style.backgroundImage = "url(\"" + url + "\")";
-    img.style.backgroundPosition = clamp(c.positionX, 0, 100) + "% " + clamp(c.positionY, 0, 100) + "%";
-    img.style.transform = "scale(" + (clamp(c.scale, 50, 150) / 100) + ")";
-    img.style.filter = "saturate(" + (clamp(c.saturation, 0, 200) / 100) + ") contrast(" + (clamp(c.contrast, 0, 200) / 100) + ") blur(" + clamp(c.blur, 0, 40) + "px)";
-    var alpha = clamp(c.opacity, 0, 100) / 100;
-    el.style.opacity = String(alpha);
+
     var blurPx = clamp(c.blur, 0, 40);
-    /* 只为模糊扩散留外扩；缩放低于 100 就老老实实缩小、露出底色 */
+    var scale = clamp(c.scale, 50, 150) / 100;
+    var px = clamp(c.positionX, 0, 100) / 100;
+    var py = clamp(c.positionY, 0, 100) / 100;
+
+    /* CSS 的 blur() 不会把像素往元素外延展，边缘会透出底色，所以必须外扩一层来"接住"扩散。
+       但外扩只能加在模糊盒上：图像自己始终按视口算 cover，再加一层放大版填满外扩区，
+       于是模糊半径怎么拉，取景都不会跟着变大（旧的写法按外扩后的盒子算 cover，40px 模糊能放大三成）。 */
     var bleed = blurPx > 0 ? Math.ceil(blurPx * 3) + 4 : 0;
-    img.style.inset = bleed > 0 ? ("-" + bleed + "px") : "0px";
+    layer.style.inset = bleed ? ("-" + bleed + "px") : "0px";
+
+    var d = dims[state.activeSlot];
+    var vw = window.innerWidth, vh = window.innerHeight;
+    if (d && d.w > 0 && d.h > 0) {
+      var fit = Math.max(vw / d.w, vh / d.h);
+      var w = d.w * fit * scale, h = d.h * fit * scale;
+      var left = bleed - px * (w - vw);
+      var top = bleed - py * (h - vh);
+      img.style.backgroundImage = "url(\"" + url + "\")";
+      img.style.backgroundSize = w + "px " + h + "px";
+      img.style.backgroundPosition = left + "px " + top + "px";
+      if (bleed > 0 && w >= vw && h >= vh) {
+        /* 第二层：同一张图按外扩盒 cover，只负责填外扩区；视口内被第一层整块盖住 */
+        img.style.backgroundImage = "url(\"" + url + "\"), url(\"" + url + "\")";
+        img.style.backgroundSize = w + "px " + h + "px, cover";
+        img.style.backgroundPosition = left + "px " + top + "px, " + (px * 100) + "% " + (py * 100) + "%";
+      }
+    } else {
+      /* 图片尺寸还没量出来：先用 cover 顶着，onload 之后会按像素重画一次 */
+      img.style.backgroundImage = "url(\"" + url + "\")";
+      img.style.backgroundSize = "cover";
+      img.style.backgroundPosition = (px * 100) + "% " + (py * 100) + "%";
+    }
+
+    layer.style.filter = "saturate(" + (clamp(c.saturation, 0, 200) / 100) + ") contrast(" + (clamp(c.contrast, 0, 200) / 100) + ")" + (blurPx > 0 ? " blur(" + blurPx + "px)" : "");
+    el.style.opacity = String(clamp(c.opacity, 0, 100) / 100);
+
     var t = clamp(c.temperature, -100, 100) / 100;
     tint.style.background = t >= 0 ? "#ff8a3d" : "#3d8aff";
     tint.style.opacity = String(Math.abs(t) * 0.5);
@@ -184,7 +224,8 @@
   /* ---------- 样式 ---------- */
   var CSS = [
     "#" + WP_ID + " { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden; }",
-    "#" + WP_ID + " .cs-img { position: absolute; inset: 0; background-size: cover; background-repeat: no-repeat; background-position: 50% 50%; transform-origin: center center; }",
+    "#" + WP_ID + " .cs-blur { position: absolute; inset: 0; }",
+    "#" + WP_ID + " .cs-img { position: absolute; inset: 0; background-size: cover; background-repeat: no-repeat; background-position: 50% 50%; }",
     "#" + WP_ID + " .cs-tint { position: absolute; inset: 0; mix-blend-mode: soft-light; }",
 
       "html." + ON_CLASS + " [class*=\"app-shell-content-fade\"]:not([class*=\"contents\"]) { opacity: 0 !important; }",
@@ -194,36 +235,43 @@
     "html." + ON_CLASS + " [class~=\"electron:bg-surface\"] { background-color: transparent !important; }",
     "html." + ON_CLASS + " div[class~=\"bg-surface\"][class~=\"inset-y-0\"] { background-color: transparent !important; }",
     "html." + ON_CLASS + " { --app-shell-sidebar-docked-background: transparent; }",
-    ".cs-card { background: rgba(20,18,26,.66); backdrop-filter: blur(20px) saturate(120%); }",
-    "#" + PANEL_ID + " { display: grid; grid-template-columns: 168px minmax(0, 1fr); gap: 20px; align-items: start; padding: 4px 4px 2px; }",
+    /* 16:9 为主；窄窗（<1000px 时不再限宽）下卡片会被压扁，min-height 兜住内容自然高度，overflow 防止溢出到卡片外 */
+    ".cs-card { aspect-ratio: 16 / 9; min-height: 276px; overflow: hidden; padding: 10px; background: rgba(20,18,26,.66); backdrop-filter: blur(20px) saturate(120%); }",
+    ".cs-card.cs-off { opacity: .45; }",
+    ".cs-card.cs-off #" + PANEL_ID + " { pointer-events: none; }",
+    "#" + SECTION_ID + " { max-width: 72%; }",
+    "@media (max-width: 1000px) { #" + SECTION_ID + " { max-width: none; } }",
+    "#" + PANEL_ID + " { display: grid; grid-template-columns: 228px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; gap: 10px 14px; height: 100%; }",
     "#" + PANEL_ID + " * { box-sizing: border-box; }",
-    "#" + PANEL_ID + " .cs-slots { display: flex; flex-direction: column; gap: 10px; max-height: 306px; overflow-y: auto; overflow-x: hidden; padding-right: 2px; scrollbar-width: thin; }",
-    "#" + PANEL_ID + " .cs-slots::-webkit-scrollbar { width: 6px; }",
-    "#" + PANEL_ID + " .cs-slots::-webkit-scrollbar-thumb { background: rgba(255,255,255,.16); border-radius: 999px; }",
-    "#" + PANEL_ID + " .cs-slot { position: relative; flex: 0 0 auto; width: 100%; aspect-ratio: 16 / 9; border-radius: 10px; border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.035); overflow: hidden; cursor: pointer; transition: border-color .15s ease, background .15s ease; }",
+    "#" + PANEL_ID + " .cs-slots { grid-column: 1; grid-row: 1 / 3; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-content: center; min-height: 0; }",
+    "#" + PANEL_ID + " .cs-slot { position: relative; min-width: 0; aspect-ratio: 16 / 9; border-radius: 7px; border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.035); overflow: hidden; cursor: pointer; transition: border-color .15s ease, background .15s ease; }",
     "#" + PANEL_ID + " .cs-slot:hover { border-color: rgba(255,255,255,.3); }",
     "#" + PANEL_ID + " .cs-slot.cs-active { border-color: #5B6BFF; box-shadow: 0 0 0 1px #5B6BFF inset; }",
     "#" + PANEL_ID + " .cs-thumb { position: absolute; inset: 0; background-size: cover; background-position: center; }",
-    "#" + PANEL_ID + " .cs-plus { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 300; color: rgba(255,255,255,.42); }",
-    "#" + PANEL_ID + " .cs-del { position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; padding: 0; display: none; align-items: center; justify-content: center; border: 0; border-radius: 6px; background: rgba(0,0,0,.55); color: #F2F4F8; cursor: pointer; }",
+    "#" + PANEL_ID + " .cs-plus { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 300; color: rgba(255,255,255,.42); }",
+    "#" + PANEL_ID + " .cs-del { position: absolute; top: 4px; right: 4px; width: 16px; height: 16px; padding: 0; display: none; align-items: center; justify-content: center; border: 0; border-radius: 4px; background: rgba(0,0,0,.6); color: #F2F4F8; cursor: pointer; }",
+    "#" + PANEL_ID + " .cs-del svg { width: 10px; height: 10px; }",
     "#" + PANEL_ID + " .cs-slot:hover .cs-del, #" + PANEL_ID + " .cs-slot.cs-active .cs-del { display: flex; }",
     "#" + PANEL_ID + " .cs-del:hover { background: rgba(255,80,80,.85); }",
-    "#" + PANEL_ID + " .cs-controls { display: flex; flex-direction: column; gap: 10px; min-width: 0; }",
-    "#" + PANEL_ID + " .cs-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }",
-    "#" + PANEL_ID + " .cs-title { font-size: 13px; color: #F2F4F8; }",
-    "#" + PANEL_ID + " .cs-reset { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; font-size: 12px; color: #C7CBD3; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.14); border-radius: 6px; cursor: pointer; }",
-    "#" + PANEL_ID + " .cs-reset:hover { color: #F2F4F8; border-color: rgba(255,255,255,.28); }",
-    "#" + PANEL_ID + " .cs-rows { display: flex; flex-direction: column; gap: 6px; }",
-    "#" + PANEL_ID + " .cs-row { display: grid; grid-template-columns: 60px minmax(0, 1fr) 40px; align-items: center; gap: 12px; }",
-    "#" + PANEL_ID + " .cs-label { font-size: 12px; color: #D3D7DE; white-space: nowrap; }",
-    "#" + PANEL_ID + " .cs-val { height: 20px; line-height: 20px; text-align: center; font-size: 11px; color: #F2F4F8; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.14); border-radius: 5px; font-variant-numeric: tabular-nums; }",
-    "#" + PANEL_ID + " .cs-range { -webkit-appearance: none; appearance: none; width: 100%; height: 18px; background: transparent; cursor: pointer; }",
+    "#" + PANEL_ID + " .cs-rows { grid-column: 2; grid-row: 1; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; align-content: center; min-height: 0; }",
+    "#" + PANEL_ID + " .cs-row { display: grid; grid-template-columns: 56px minmax(0, 1fr) 34px; align-items: center; gap: 8px; }",
+    "#" + PANEL_ID + " .cs-label { font-size: 13px; line-height: 18px; font-weight: 500; color: #DFDFDF; white-space: nowrap; }",
+    "#" + PANEL_ID + " .cs-val { height: 22px; line-height: 22px; text-align: center; font-size: 13px; color: #F2F4F8; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.14); border-radius: 5px; font-variant-numeric: tabular-nums; }",
+    "#" + PANEL_ID + " .cs-range { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: transparent; cursor: pointer; }",
     "#" + PANEL_ID + " .cs-range::-webkit-slider-runnable-track { height: 3px; border-radius: 999px; background: rgba(255,255,255,.16); }",
-    "#" + PANEL_ID + " .cs-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; margin-top: -4.5px; border: 0; border-radius: 50%; background: #5B6BFF; box-shadow: 0 0 0 1px rgba(0,0,0,.35); }",
+    "#" + PANEL_ID + " .cs-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; margin-top: -5px; border: 0; border-radius: 50%; background: #5B6BFF; box-shadow: 0 0 0 1px rgba(0,0,0,.35); }",
     "#" + PANEL_ID + " .cs-range:hover::-webkit-slider-thumb { background: #7C89FF; }",
-    "#" + PANEL_ID + " .cs-hint { font-size: 11px; line-height: 16px; color: rgba(255,255,255,.52); }",
+    "#" + PANEL_ID + " .cs-foot { grid-column: 2; grid-row: 2; display: flex; align-items: center; justify-content: space-between; gap: 8px; }",
+    "#" + PANEL_ID + " .cs-hint { font-size: 13px; line-height: 18px; color: rgba(255,255,255,.6); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
     "#" + PANEL_ID + " .cs-hint.cs-hint-error { color: #FF9A9A; }",
-    "#" + PANEL_ID + " .cs-slot:focus-visible, #" + PANEL_ID + " .cs-reset:focus-visible, #" + PANEL_ID + " .cs-del:focus-visible, #" + PANEL_ID + " .cs-range:focus-visible { outline: 2px solid #5B6BFF; outline-offset: 2px; }"
+    "#" + PANEL_ID + " .cs-reset { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 9px; font-size: 13px; color: #DFDFDF; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.14); border-radius: 5px; cursor: pointer; flex: 0 0 auto; }",
+    "#" + PANEL_ID + " .cs-reset:hover { color: #F2F4F8; border-color: rgba(255,255,255,.28); }",
+    "#" + PANEL_ID + " .cs-slot:focus-visible, #" + PANEL_ID + " .cs-reset:focus-visible, #" + PANEL_ID + " .cs-del:focus-visible, #" + PANEL_ID + " .cs-range:focus-visible { outline: 2px solid #5B6BFF; outline-offset: 2px; }",
+    "#" + SECTION_ID + " .cs-switch { position: relative; flex: 0 0 auto; width: 34px; height: 20px; padding: 0; border: 1px solid rgba(255,255,255,.18); border-radius: 999px; background: rgba(255,255,255,.12); cursor: pointer; transition: background .15s ease, border-color .15s ease; }",
+    "#" + SECTION_ID + " .cs-switch[aria-checked=\"true\"] { background: #5B6BFF; border-color: #5B6BFF; }",
+    "#" + SECTION_ID + " .cs-switch .cs-knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s ease; }",
+    "#" + SECTION_ID + " .cs-switch[aria-checked=\"true\"] .cs-knob { transform: translateX(14px); }",
+    "#" + SECTION_ID + " .cs-switch:focus-visible { outline: 2px solid #5B6BFF; outline-offset: 2px; }"
   ].join("");
 
   function ensureStyle() {
@@ -236,7 +284,7 @@
     document.head.appendChild(el);
   }
 
-  var HINT_TEXT = "点击槽位选择壁纸，点 + 导入本地图片（PNG / JPG / WEBP，单张 \u2264 64MB）。";
+  var HINT_TEXT = "点 + 导入图片（\u2264 64MB）";
 
   var TRASH_SVG = "<svg width=\"13\" height=\"13\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\"><path d=\"M3 6h18\"/><path d=\"M8 6V4h8v2\"/><path d=\"M19 6l-1 14H6L5 6\"/><path d=\"M10 11v5\"/><path d=\"M14 11v5\"/></svg>";
 
@@ -249,10 +297,9 @@
       return "<div class=\"cs-row\"><div class=\"cs-label\">" + c.label + "</div><input type=\"range\" class=\"cs-range\" min=\"0\" max=\"100\" step=\"1\" data-key=\"" + c.key + "\" aria-label=\"" + c.label + "\"><div class=\"cs-val\" data-val=\"" + c.key + "\" aria-hidden=\"true\">0</div></div>";
     }).join("");
     return "<div class=\"cs-slots\">" + slots + "</div>" +
-      "<div class=\"cs-controls\"><div class=\"cs-head\"><div class=\"cs-title\">壁纸微调参数</div>" +
-      "<button type=\"button\" class=\"cs-reset\">\u21ba 恢复默认</button></div>" +
       "<div class=\"cs-rows\">" + rows + "</div>" +
-      "<div class=\"cs-hint\" aria-live=\"polite\">" + HINT_TEXT + "</div></div>";
+      "<div class=\"cs-foot\"><span class=\"cs-hint\" aria-live=\"polite\">" + HINT_TEXT + "</span>" +
+      "<button type=\"button\" class=\"cs-reset\">\u21ba 恢复默认</button></div>";
   }
 
   function useSlot(idx) {
@@ -344,6 +391,7 @@
     dbDel(slotKey(slot)).catch(function () { });
     if (urls[slot]) { try { URL.revokeObjectURL(urls[slot]); } catch (e) { } }
     delete urls[slot];
+    delete dims[slot];
     if (state.activeSlot === slot) state.activeSlot = null;
     saveState();
     renderSlots();
@@ -381,6 +429,13 @@
     }
   }
 
+  function renderSwitch() {
+    var btn = document.getElementById(SWITCH_ID);
+    if (btn) btn.setAttribute("aria-checked", state.enabled ? "true" : "false");
+    var card = document.querySelector("#" + SECTION_ID + " .cs-card");
+    if (card) card.classList.toggle("cs-off", !state.enabled);
+  }
+
   function renderControls() {
     var host = document.getElementById(PANEL_ID);
     if (!host) return;
@@ -410,8 +465,11 @@
   function ensureSection() {
     var container = findAppearanceContainer();
     if (!container) return;
+    /* 父容器靠 gap 隔开每个区块；把这个 gap 用负 margin 抵掉，皮肤就紧贴上面那条分割线 */
+    var gap = parseFloat(getComputedStyle(container).rowGap);
+    var pull = "-" + (isFinite(gap) && gap > 0 ? gap : 0) + "px";
     var section = document.getElementById(SECTION_ID);
-    if (section && section.parentElement === container) return;
+    if (section && section.parentElement === container) { section.style.marginTop = pull; renderSwitch(); return; }
     if (section && section.parentElement) section.parentElement.removeChild(section);
 
     section = document.createElement("section");
@@ -419,7 +477,22 @@
     section.className = "flex flex-col";
     var head = document.createElement("div");
     head.className = "flex justify-between gap-4 items-center pb-1.5 min-h-toolbar";
-    head.innerHTML = "<div class=\"flex min-w-0 flex-1 flex-col gap-0.5\"><div class=\"font-medium text-default text-base\">皮肤</div></div>";
+    head.innerHTML = "<div class=\"flex min-w-0 items-center gap-3\"><div class=\"font-medium text-default text-base\">皮肤</div></div>";
+    var sw = document.createElement("button");
+    sw.type = "button";
+    sw.id = SWITCH_ID;
+    sw.className = "cs-switch";
+    sw.setAttribute("role", "switch");
+    sw.setAttribute("aria-label", "启用皮肤");
+    sw.innerHTML = "<span class=\"cs-knob\"></span>";
+    sw.addEventListener("click", function () {
+      state.enabled = !state.enabled;
+      saveState();
+      renderSwitch();
+      applyWallpaper();
+    });
+    /* 开关跟着标题文字走，不再被 justify-between 推到最右边 */
+    head.firstElementChild.appendChild(sw);
     var body = document.createElement("div");
     body.className = "flex flex-col gap-1.5";
     var holder = document.createElement("div");
@@ -428,9 +501,11 @@
     body.appendChild(holder);
     section.appendChild(head);
     section.appendChild(body);
+    section.style.marginTop = pull;
     container.appendChild(section);
     renderSlots();
     renderControls();
+    renderSwitch();
   }
 
   function sync() {
@@ -447,49 +522,6 @@
     }, 120);
   }
 
-  function presetBlob(pr) {
-    return new Promise(function (resolve) {
-      try {
-        var w = 1920, h = 1080;
-        var cv = document.createElement("canvas");
-        cv.width = w; cv.height = h;
-        var g = cv.getContext("2d");
-        if (!g || !cv.toBlob) { resolve(null); return; }
-        var lg = g.createLinearGradient(0, 0, w, h);
-        lg.addColorStop(0, pr.a); lg.addColorStop(0.55, pr.b); lg.addColorStop(1, pr.c);
-        g.fillStyle = lg; g.fillRect(0, 0, w, h);
-        var rg = g.createRadialGradient(w * 0.76, h * 0.18, 0, w * 0.76, h * 0.18, h * 1.1);
-        rg.addColorStop(0, pr.glow); rg.addColorStop(1, "rgba(0,0,0,0)");
-        g.fillStyle = rg; g.fillRect(0, 0, w, h);
-        cv.toBlob(function (b) { resolve(b); }, "image/jpeg", 0.92);
-      } catch (e) { resolve(null); }
-    });
-  }
-
-  function seedPresets() {
-    var any = false;
-    for (var i = 0; i < SLOTS; i++) if (urls[i]) any = true;
-    if (any) return Promise.resolve(false);
-    try { if (localStorage.getItem(LS_KEY + ".seeded") === "1") return Promise.resolve(false); } catch (e) { }
-    var jobs = [];
-    var wrote = 0;
-    for (var j = 0; j < Math.min(PRESETS.length, SLOTS - 1); j++) {
-      (function (slot, pr) {
-        jobs.push(presetBlob(pr).then(function (blob) {
-          if (!blob) return null;
-          return dbPut(slotKey(slot), blob).then(function () { setUrl(slot, blob); wrote = wrote + 1; });
-        }).catch(function () { }));
-      })(j, PRESETS[j]);
-    }
-    return Promise.all(jobs).then(function () {
-      /* 一张都没写进去就别打标记，否则用户永远拿不到预设、也看不出为什么 */
-      if (wrote > 0) { try { localStorage.setItem(LS_KEY + ".seeded", "1"); } catch (e) { } }
-      if (state.activeSlot === null && urls[0]) { state.activeSlot = 0; saveState(); }
-      renderSlots();
-      return wrote > 0;
-    });
-  }
-
   function start() {
     loadState();
     ensureStyle();
@@ -498,10 +530,14 @@
       applyWallpaper();
       renderSlots();
       scheduleSync();
-      return seedPresets();
-    }).then(function () { applyWallpaper(); });
+    });
     observer = new MutationObserver(function () { scheduleSync(); });
     observer.observe(document.documentElement, { childList: true, subtree: true });
+    /* 取景按视口算像素，窗口一变就得重画 */
+    if (!onResize) {
+      onResize = function () { try { applyWallpaper(); } catch (e) { } };
+      window.addEventListener("resize", onResize);
+    }
     scheduleSync();
   }
 
@@ -512,6 +548,7 @@
     shutdown: function () {
       if (observer) { observer.disconnect(); observer = null; }
       if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; }
+      if (onResize) { window.removeEventListener("resize", onResize); onResize = null; }
       for (var k in urls) { try { URL.revokeObjectURL(urls[k]); } catch (e) { } }
       urls = {};
       if (fileInput) { try { fileInput.remove(); } catch (e) { } fileInput = null; }

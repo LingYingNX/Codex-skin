@@ -31,7 +31,7 @@ No linter, no build step. "Done" means: `node --check skin.js` and `node --test 
 
 | File | Role |
 |------|------|
-| `skin.js` | Inject payload: wallpaper layer, transparency CSS, 外观-page panel, preset seeding, persistence. UTF-8, Chinese UI strings. |
+| `skin.js` | Inject payload: wallpaper layer, transparency CSS, 外观-page panel (16:9 card + skin switch), persistence. UTF-8, Chinese UI strings. |
 | `skin-host.ps1` | CDP host: waits for Codex, attaches on :9229, injects, reconnects on reload/crash. ASCII only. |
 | `skin-host.vbs` | Windowless launcher used by the scheduled task (`wscript //B`). |
 | `install.ps1` | Registers/unregisters the `Codex Skin Host` scheduled task; kills the old host first so a re-run really restarts it. ASCII only. |
@@ -48,6 +48,11 @@ No linter, no build step. "Done" means: `node --check skin.js` and `node --test 
 - Wallpapers live in IndexedDB `codexSkin/wallpapers` (keys `slot0..slot4`), controls in `localStorage` key `codexSkin.v1`. Wiping test data means clearing both.
 - 透明度 is pure alpha: at temperature 0, 100 = pixel-identical to the source image, 50 = half-blend with `#14121a`. Do not reintroduce a scrim or overlay; that was removed because it broke this guarantee. Temperature adds a `soft-light` layer inside the wallpaper, so 100 is "image + tint" there.
 - 缩放 below 100 shrinks the wallpaper and shows `#14121a` at the edges; the layer only bleeds outward for `blur > 0`. Do not reintroduce a fixed bleed for scale — it silently zoomed the framing at 99.
+- 模糊 bleeds the `.cs-blur` wrapper only. `.cs-img` must keep a viewport-sized `cover` computed by hand (`dims` + `resize`), with a second `cover` layer filling the bleed ring. Going back to "bleed the image box and let cover follow it" zooms the framing ~32% at 40px blur.
+- The panel sits flush under the previous block via `margin-top: -<container row-gap>` read from computed style, is `max-width: 72%` wide, and the card is `aspect-ratio: 16 / 9` (524x295 at 1143px). All three are measured — re-measure the DOM before touching layout, and keep the inner budget under `clientHeight`: the grid is `228px | minmax(0,1fr)`, slots in a 2-column grid on the left, 8 sliders single-column (260px wide, 154px range) plus the foot row on the right.
+- Panel typography must match the appearance page, not a private scale: labels 13px/500 (native row labels measure `13px / 500 / lh 18.57`), values and footer text 13px, section title 14px (`text-base`). Do not shrink below 13px — earlier 10px values read as micro-print next to native rows.
+- No built-in wallpapers. The canvas preset generator was deleted on request; slots start empty and the user imports their own. Do not reintroduce seeded content.
+- The 皮肤 switch lives in the section head, inside the same flex row as the 「皮肤」 label with a 12px gap (`role="switch"`, `aria-checked`, id `codex-skin-switch`) — not pushed to the far right. Off = `html` loses `codex-skin-on`, wallpaper `display:none`, card gets `.cs-off` (dimmed + `pointer-events:none`); the panel itself must stay visible or it could never be turned back on. `state.enabled` persists in `codexSkin.v1`.
 
 ## Git
 Single branch `main`, no CI. `skin-host.log` is git-ignored: it is runtime output with absolute local paths. Do not commit or push unless asked.
