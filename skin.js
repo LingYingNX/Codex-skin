@@ -1,7 +1,7 @@
 /* Codex 皮肤 — renderer payload, injected by skin-host.ps1 over CDP */
 (function () {
   "use strict";
-  var VERSION = "1.0.23";
+  var VERSION = "1.0.24";
   var GLOBAL_KEY = "__codexSkinRuntime";
   var LS_KEY = "codexSkin.v1";
   var DB_NAME = "codexSkin";

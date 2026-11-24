@@ -93,6 +93,3 @@ node --test skin.test.mjs
 # 改了 skin.js 要生效：先改里面的 VERSION，再重启宿主 + 在 Codex 里 Ctrl+R
 # 不 bump VERSION 的话新载荷会让位给旧实例，改动看不到
 ```
-
-
-<!-- hot-update smoke test -->

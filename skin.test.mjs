@@ -48,6 +48,6 @@ test("脏数据被 clamp 兜住，不会让壁纸整个透明", () => {
 });
 
 test("运行时对象只暴露版本、接管、收摊和两个纯映射", () => {
-  assert.equal(rt.version, "1.0.23");
+  assert.equal(rt.version, "1.0.24");
   assert.deepEqual(Object.keys(rt).sort(), ["ensure", "fromSlider", "shutdown", "toSlider", "version"]);
 });
