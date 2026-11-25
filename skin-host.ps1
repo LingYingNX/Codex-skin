@@ -153,6 +153,17 @@ function Invoke-Evaluate($cdp, [string]$expression) {
 # polls: it blocks on the socket and wakes only when the button is pressed.
 $BindingName = "codexSkinUpdate"
 
+# A PowerShell 5.1 host is ~65 MB before it does anything (clr.dll + mscorlib +
+# the framework DLLs). Attaching a CDP session adds ~30 MB more. EmptyWorkingSet
+# pushes those pages to standby once the work is done, which is why the host
+# trims after every attach and after every update.
+try {
+  Add-Type -Namespace SkinHost -Name Mem -MemberDefinition '[DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess);' -ErrorAction Stop
+} catch { }
+function Trim-HostWorkingSet {
+  try { [void][SkinHost.Mem]::EmptyWorkingSet([System.Diagnostics.Process]::GetCurrentProcess().Handle) } catch { }
+}
+
 function Get-BindingPayload([string]$raw) {
   try {
     $msg = $raw | ConvertFrom-Json
@@ -224,7 +235,9 @@ function Invoke-SkinUpdate($cdp, [string]$token) {
   } finally {
     $ErrorActionPreference = $prev
   }
-  return (Set-UpdateState $cdp $token $state)
+  [void](Set-UpdateState $cdp $token $state)
+  Trim-HostWorkingSet
+  return
 }
 
 function Attach-AndInject() {
@@ -244,6 +257,7 @@ function Attach-AndInject() {
     [void](Invoke-Evaluate $cdp $source)
     $probe = Invoke-Evaluate $cdp "JSON.stringify({v:(window.__codexSkinRuntime||{}).version||null})"
     Write-Log ("injected, probe=" + $probe.value)
+    Trim-HostWorkingSet
     return $cdp
   } catch {
     # Close the half-open session too, or -Watch leaks one socket every 3 s.

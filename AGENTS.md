@@ -31,7 +31,7 @@ No linter, no build step. **Done** = `node --check skin.js` and `node --test ski
 |------|------|
 | `skin.js` | Inject payload: wallpaper layer, transparency CSS, 外观-page panel (16:9 card, skin switch, check-for-update button), persistence. UTF-8, Chinese UI strings. |
 | `skin-host.ps1` | CDP host: waits for Codex, attaches on :9229, injects, re-attaches on reload/crash; also runs the update pull the panel asks for. ASCII only. |
-| `skin-host.vbs` | Windowless launcher used by the scheduled task (`wscript //B`). |
+| `skin-host.vbs` | Windowless launcher (`wscript //B`) — used by the scheduled task and by a Startup-folder shortcut; both paths are safe because it bails out in ~9ms while `skin-host.pid` is locked. |
 | `install.ps1` | Registers / unregisters the `Codex Skin Host` task; kills the old host first so a re-run really restarts it. ASCII only. |
 | `skin.test.mjs` | `node --test` suite: slider mapping round-trip, clamp on dirty input, public runtime surface. |
 | `README.md` | User-facing install / usage notes. |
