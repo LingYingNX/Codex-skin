@@ -190,8 +190,17 @@ function Set-UpdateState($cdp, [string]$token, $state) {
   [void](Invoke-Evaluate $cdp ("localStorage.setItem('codexSkin.update.state', '" + $lit + "')"))
 }
 
+function Get-RemoteVersion() {
+  # The VERSION line is pure ASCII, so decoding the whole file as ANSI is harmless.
+  try {
+    $text = (& git -C $here show origin/main:skin.js 2>$null) -join " "
+    if ($text -match 'var VERSION = "([^"]+)"') { return $matches[1] }
+  } catch { }
+  return ""
+}
+
 function Invoke-SkinUpdate($cdp, [string]$token) {
-  $state = @{ ok = $false; updated = $false; version = $null; message = ""; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+  $state = @{ ok = $false; updated = $false; version = $null; remote = $null; message = ""; at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
   $prev = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
   try {
@@ -202,6 +211,9 @@ function Invoke-SkinUpdate($cdp, [string]$token) {
     if ($LASTEXITCODE -ne 0) { $state.message = "fetch failed: $fetch"; return (Set-UpdateState $cdp $token $state) }
     $newHead = (& git -C $here rev-parse origin/main 2>&1) -join " "
     if ($LASTEXITCODE -ne 0) { $state.message = "no origin/main: $newHead"; return (Set-UpdateState $cdp $token $state) }
+    # What the panel shows when the pull cannot go through: the version actually
+    # waiting on the remote, not the one already running here.
+    $state.remote = Get-RemoteVersion
     if ($newHead.Trim() -eq $oldHead.Trim()) {
       $state.ok = $true
       $state.message = ("up to date at " + (Short-Hash $oldHead))

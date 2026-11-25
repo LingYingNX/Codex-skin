@@ -1,7 +1,7 @@
 /* Codex 皮肤 — renderer payload, injected by skin-host.ps1 over CDP */
 (function () {
   "use strict";
-  var VERSION = "0.1.2";
+  var VERSION = "0.1.4";
   var GLOBAL_KEY = "__codexSkinRuntime";
   var LS_KEY = "codexSkin.v1";
   var DB_NAME = "codexSkin";
@@ -280,6 +280,8 @@
     "#" + SECTION_ID + " .cs-update svg { flex: 0 0 auto; }",
     "#" + SECTION_ID + " .cs-update:hover { color: #F2F4F8; border-color: rgba(255,255,255,.28); }",
     "#" + SECTION_ID + " .cs-update.cs-busy { opacity: .7; }",
+    "@keyframes cs-spin { to { transform: rotate(360deg); } }",
+    "#" + SECTION_ID + " .cs-update.cs-busy svg { animation: cs-spin 1s linear infinite; }",
     "#" + SECTION_ID + " .cs-update.cs-ok { color: #7BE0A3; border-color: rgba(123,224,163,.4); }",
     "#" + SECTION_ID + " .cs-update.cs-bad { color: #FF9A9A; border-color: rgba(255,154,154,.4); }",
     "#" + SECTION_ID + " .cs-update:focus-visible { outline: 2px solid #5B6BFF; outline-offset: 2px; }"
@@ -460,15 +462,24 @@
     b.title = title || text;
   }
 
+  /* 按钮上常驻版本号：平时是正在运行的版本，拉到新版本就换成新版本号；
+     拉不动但远端确实有新版本时，显示远端那个，用红色表示没换上 */
+  function versionText(v) { return "v" + (v || VERSION); }
+
+  function applyUpdateState(st, note) {
+    if (st.updated) { setUpdLabel(versionText(st.version), "cs-ok", st.message || note); return; }
+    if (st.ok) { setUpdLabel(versionText(VERSION), "cs-ok", "已是最新，" + versionText(VERSION)); return; }
+    var remote = st.remote ? String(st.remote) : "";
+    var shown = remote && remote !== VERSION ? remote : VERSION;
+    setUpdLabel(versionText(shown), "cs-bad", st.message || "宿主没有返回原因");
+  }
+
   function restoreUpdateLabel() {
     var st = null;
     try { st = JSON.parse(localStorage.getItem(UPDATE_STATE_KEY) || "null"); } catch (e) { }
-    if (!st || !st.at) return;
     /* 更新成功会换一个新实例重建面板，所以结果只能靠这里回读 */
-    if (Date.now() - st.at > 120000) return;
-    if (st.updated) setUpdLabel("已更新 " + (st.version || ""), "cs-ok", st.message || "刚拉取并热更新完成");
-    else if (st.ok) setUpdLabel("已是最新", "cs-ok", st.message || "远端没有新提交");
-    else setUpdLabel("更新失败", "cs-bad", st.message || "宿主没有返回原因");
+    if (st && st.at && Date.now() - st.at < 120000) { applyUpdateState(st, "刚拉取并热更新完成"); return; }
+    setUpdLabel(versionText(VERSION), "", "当前 " + versionText(VERSION) + "，点一下检查远端");
   }
 
   function checkForUpdate() {
@@ -481,7 +492,7 @@
       return;
     }
     updateBusy = true;
-    setUpdLabel("检查中…", "cs-busy", "宿主正在拉取远端");
+    setUpdLabel(versionText(VERSION), "cs-busy", "检查中，宿主正在拉取远端");
     try {
       window.codexSkinUpdate(token);
     } catch (e) {
@@ -496,14 +507,12 @@
       try { st = JSON.parse(localStorage.getItem(UPDATE_STATE_KEY) || "null"); } catch (e) { }
       if (st && st.for === token) {
         clearInterval(updateTimer); updateTimer = null; updateBusy = false;
-        if (st.updated) setUpdLabel("已更新 " + (st.version || ""), "cs-ok", st.message || "已热更新");
-        else if (st.ok) setUpdLabel("已是最新", "cs-ok", st.message || "远端没有新提交");
-        else setUpdLabel("更新失败", "cs-bad", st.message || "宿主没有返回原因");
+        applyUpdateState(st, "已热更新");
         return;
       }
       if (Date.now() - startedAt > 45000) {
         clearInterval(updateTimer); updateTimer = null; updateBusy = false;
-        setUpdLabel("无响应", "cs-bad", "宿主没应答，看 skin-host.log");
+        setUpdLabel(versionText(VERSION), "cs-bad", "宿主没应答，看 skin-host.log");
       }
     }, 400);
   }
@@ -569,7 +578,7 @@
     upd.className = "cs-update";
     upd.title = "检查更新";
     upd.setAttribute("aria-label", "检查更新");
-    upd.innerHTML = REFRESH_SVG + "<span class=\"cs-upd-label\">检查更新</span>";
+    upd.innerHTML = REFRESH_SVG + "<span class=\"cs-upd-label\">" + versionText(VERSION) + "</span>";
     upd.addEventListener("click", checkForUpdate);
     /* 开关和更新按钮都跟着标题文字走，不再被 justify-between 推到最右边 */
     head.firstElementChild.appendChild(sw);
